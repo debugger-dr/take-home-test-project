@@ -53,10 +53,10 @@ class FifoQueue:
         item.attempt += 1
         self._items.appendleft(item)
 
-    def peek(self) -> QueuedRequest | None:
+    def peek(self, now: float) -> QueuedRequest | None:
         return self._items[0] if self._items else None
 
-    def pop(self) -> QueuedRequest:
+    def pop(self, now: float) -> QueuedRequest:
         return self._items.popleft()
 
     def adjust(self, tenant: str, tokens: int) -> None:
@@ -65,6 +65,11 @@ class FifoQueue:
 
 def fifo_scheduler(config: SchedulerConfig) -> Scheduler:
     return Scheduler(config, FifoQueue(t.name for t in config.tenants))
+
+
+def no_p0_allowance_scheduler(config: SchedulerConfig) -> Scheduler:
+    """Negative control: P0 traffic is not capped, so a flood of it starves everything else."""
+    return Scheduler(replace(config, p0_rate=1e12, p0_burst=10**12))
 
 
 def unpaced_scheduler(config: SchedulerConfig) -> Scheduler:

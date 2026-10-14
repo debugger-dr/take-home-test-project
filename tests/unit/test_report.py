@@ -42,6 +42,16 @@ def test_idle_waits_exclude_requests_that_queued_behind_their_own_tenant():
     assert report.waits_when_idle("a", 0, 100) == [2, 2]
 
 
+def test_waits_can_be_filtered_by_class():
+    records = {
+        "urgent": RequestRecord("a", Klass.P0, 0.0, dispatched_at=1.0),
+        "normal": RequestRecord("a", Klass.P1, 0.0, dispatched_at=5.0),
+    }
+    report = Report(records, STATS, horizon=100)
+    assert report.waits("a", 0, 10, Klass.P0) == [1.0]
+    assert sorted(report.waits("a", 0, 10)) == [1.0, 5.0]
+
+
 def test_max_dispatch_gap_only_considers_dispatches_inside_the_window():
     times = [1, 2, 5, 6, 40]
     records = {str(i): record(submitted=0, dispatched=t) for i, t in enumerate(times)}

@@ -32,11 +32,11 @@ class Report:
     provider: ProviderStats
     horizon: float
 
-    def waits(self, tenant: str, start: float, end: float) -> list[float]:
+    def waits(self, tenant: str, start: float, end: float, klass: Klass | None = None) -> list[float]:
         """Queue wait of requests submitted in [start, end); undispatched ones are counted up to the horizon."""
         return [
             (r.dispatched_at if r.dispatched_at is not None else self.horizon) - r.submitted_at
-            for r in self._submitted(tenant, start, end)
+            for r in self._submitted(tenant, start, end, klass)
         ]
 
     def waits_when_idle(self, tenant: str, start: float, end: float) -> list[float]:
@@ -68,10 +68,12 @@ class Report:
     def requests_per_minute(self, tenant: str, start: float, end: float) -> float:
         return sum(1 for _ in self._completed(tenant, start, end)) * 60 / (end - start)
 
-    def _submitted(self, tenant: str, start: float, end: float) -> list[RequestRecord]:
+    def _submitted(
+        self, tenant: str, start: float, end: float, klass: Klass | None = None
+    ) -> list[RequestRecord]:
         return [
             r for r in self.records.values()
-            if r.tenant == tenant and start <= r.submitted_at < end
+            if r.tenant == tenant and start <= r.submitted_at < end and klass in (None, r.klass)
         ]
 
     def _completed(self, tenant: str, start: float, end: float):

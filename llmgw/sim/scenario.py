@@ -22,6 +22,7 @@ class Scenario:
     limits: ProviderLimits
     profiles: tuple[TenantProfile, ...]
     weights: Mapping[str, int] = field(default_factory=dict)
+    settings: Mapping[str, object] = field(default_factory=dict)
     counting: CountingMode = CountingMode.RESERVE_AT_START
     window_mode: WindowMode = WindowMode.ROLLING
     duration: float = 600.0
@@ -35,7 +36,7 @@ class Scenario:
 
     def scheduler_config(self) -> SchedulerConfig:
         tenants = tuple(TenantConfig(p.tenant, self.weights.get(p.tenant, 1)) for p in self.profiles)
-        return SchedulerConfig(self.limits, tenants)
+        return SchedulerConfig(self.limits, tenants, **self.settings)
 
     def run(self, make_scheduler: Callable[[SchedulerConfig], SchedulerPort] = Scheduler) -> Report:
         requests = Workload(self.profiles, self.seed).generate(self.duration)

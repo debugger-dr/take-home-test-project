@@ -69,6 +69,9 @@ def test_tenant_names_must_be_unique():
         ("base_quantum", 0),
         ("pacing_burst", -0.1),
         ("pacing_burst", 1.5),
+        ("age_p2_to_p1", 0),
+        ("p0_rate", 0),
+        ("p0_burst", 0),
     ],
 )
 def test_invalid_scheduler_settings_are_rejected(field, value):

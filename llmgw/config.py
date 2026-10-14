@@ -37,6 +37,9 @@ class SchedulerConfig:
     input_safety: float = 1.15
     base_quantum: int = 4_000
     pacing_burst: float = 0.05
+    age_p2_to_p1: float = 30.0
+    p0_rate: float = 300.0
+    p0_burst: int = 8_000
 
     def __post_init__(self) -> None:
         names = [t.name for t in self.tenants]
@@ -46,6 +49,8 @@ class SchedulerConfig:
         _require(self.input_safety >= 1, "input_safety must be at least 1")
         _require(self.base_quantum > 0, "base_quantum must be positive")
         _require(0 <= self.pacing_burst <= 1, "pacing_burst must be in [0, 1]")
+        _require(self.age_p2_to_p1 > 0, "age_p2_to_p1 must be positive")
+        _require(self.p0_rate > 0 and self.p0_burst > 0, "p0_rate and p0_burst must be positive")
 
     @property
     def usable_tokens(self) -> int:

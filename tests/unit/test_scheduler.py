@@ -3,10 +3,12 @@ import pytest
 from llmgw.config import ProviderLimits, SchedulerConfig, TenantConfig
 from llmgw.scheduler import Scheduler
 from llmgw.sim.controls import FifoQueue
-from llmgw.types import Accepted, Reason, Rejected, Usage
+from llmgw.types import Accepted, Klass, Reason, Rejected, Usage
 
 
-def make_config(tpm=1_000, rpm=100, tenants=("a", "b"), quantum=10_000, pacing_burst=1.0) -> SchedulerConfig:
+def make_config(
+    tpm=1_000, rpm=100, tenants=("a", "b"), quantum=10_000, pacing_burst=1.0, **settings
+) -> SchedulerConfig:
     return SchedulerConfig(
         limits=ProviderLimits(rpm=rpm, tpm=tpm, window=10.0),
         tenants=tuple(TenantConfig(t) for t in tenants),
@@ -14,13 +16,14 @@ def make_config(tpm=1_000, rpm=100, tenants=("a", "b"), quantum=10_000, pacing_b
         input_safety=1.0,
         base_quantum=quantum,
         pacing_burst=pacing_burst,
+        **settings,
     )
 
 
 @pytest.fixture
 def req(make_request):
-    def factory(id: str, tenant: str = "a", cost: int = 200):
-        return make_request(id=id, tenant=tenant, est_input=cost - 100, max_output=100)
+    def factory(id: str, tenant: str = "a", cost: int = 200, klass: Klass = Klass.P1):
+        return make_request(id=id, tenant=tenant, est_input=cost - 100, max_output=100, klass=klass)
 
     return factory
 
@@ -137,6 +140,42 @@ def test_completion_and_rejection_callbacks_are_idempotent(req):
 
 def test_no_wakeup_is_needed_for_an_empty_queue():
     assert Scheduler(make_config()).next_wakeup(0) is None
+
+
+def test_p0_is_dispatched_before_earlier_p1_requests_of_any_tenant(req):
+    scheduler = Scheduler(make_config(tpm=10_000))
+    scheduler.submit(req("p1", tenant="a"), now=0)
+    scheduler.submit(req("p0", tenant="b", klass=Klass.P0), now=0)
+    assert ids(scheduler.poll(0)) == ["p0", "p1"]
+
+
+def test_p0_beyond_the_allowance_is_demoted_behind_queued_p1(req):
+    scheduler = Scheduler(make_config(tpm=10_000, p0_rate=100, p0_burst=200))
+    scheduler.submit(req("p1"), now=0)
+    for name in ("p0a", "p0b", "p0c"):
+        scheduler.submit(req(name, klass=Klass.P0), now=0)
+    assert ids(scheduler.poll(0)) == ["p0a", "p0b", "p1", "p0c"]
+
+
+def test_p0_dispatch_is_charged_to_the_tenants_fair_share(req):
+    scheduler = Scheduler(make_config(tpm=10_000, quantum=200))
+    for request_id, tenant in [("a1", "a"), ("a2", "a"), ("b1", "b"), ("b2", "b")]:
+        scheduler.submit(req(request_id, tenant=tenant), now=0)
+    scheduler.submit(req("p", tenant="a", klass=Klass.P0), now=0)
+    assert ids(scheduler.poll(0)) == ["p", "b1", "a1", "b2", "a2"]
+
+
+def test_rejected_p0_returns_to_the_front_of_the_p0_lane(req):
+    scheduler = Scheduler(make_config(tpm=10_000))
+    scheduler.submit(req("p0", klass=Klass.P0), now=0)
+    scheduler.submit(req("p1"), now=0)
+    assert ids(scheduler.poll(0)) == ["p0", "p1"]
+
+    scheduler.on_provider_rejected("p0", retry_after=1.0, now=0.5)
+    scheduler.submit(req("late", klass=Klass.P1), now=1.0)
+    retried = scheduler.poll(2.0)
+    assert ids(retried) == ["p0", "late"]
+    assert retried[0].attempt == 2
 
 
 def test_fair_queue_interleaves_tenants_while_fifo_does_not(req):
