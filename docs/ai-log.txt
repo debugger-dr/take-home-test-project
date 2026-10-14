@@ -1,0 +1,189 @@
+AI USAGE LOG
+============
+
+TOOLS AND MODELS
+  Claude Code (VS Code extension) with Claude Sonnet 5.5 (claude-sonnet-5-5).
+  Used for design review, drafting the design document and plan, writing parts
+  of code and tests, and reading test failures.Built the diagram myself.
+
+
+WHERE AI WAS USED
+-----------------
+  Understanding the brief
+
+  Architecture
+    AI: critiqued my sketch and architecture, compared sandbox options, drafted 
+    the gateway and limiter designs.
+    Me: made the calls: slice, tenancy, storage, orchestration, definitions.
+
+  Design document and diagrams
+    AI: generated DESIGN.docx, plan.md.
+    Me: hand edited the docx, reviewed every section, edited the plan aswell.
+
+  Code and tests
+    ME: wrote the scheduler, simulator, ledger, tests and demo, step by step.
+    AI: create some of the test and refine code.
+
+  Debugging
+    AI: Ran test.
+    Me: debugged issues.
+
+
+WHERE I OVERRODE THE AI
+-----------------------
+
+I treated the AI's design suggestions as options, not instructions, and changed
+them where I disagreed, at the architecture level as well as on single choices.
+The architecture-level overrides:
+
+  - Agent model. The AI suggested an agent should be durable state (an event
+    log or a row) that a shared worker runs only while it is active. I
+    reshaped it: an agent is a YAML file (instructions, tools, access) that is
+    loaded into a generic pod per request, and the pod holds only
+    infrastructure. The AI agreed it works, with one caveat that I accepted:
+    the run's state still has to live outside the pod, or a restart loses it.
+  - Observability. The AI suggested building status and cost from the run's
+    event log, plus standard metrics. I chose Splunk Logging and Splunk
+    Observability, and the design now emits events to Splunk while the ledger
+    keeps the exact totals.
+  - Slice, tenant isolation, agent definitions and orchestration: entries 1 to
+    4 below.
+
+1. Which slice to build
+   Asked:    which slice to pick, given "build the part you are least sure of".
+   Produced: a recommendation for the sandboxed executor (most feasibility
+             risk), with the tool gateway as the safer alternative.
+   Did:      picked the LLM rate limit, fairness and cost layer instead. One
+             key means about 170 LLM calls per second (about 34M tokens a
+             minute), so the quota is the binding constraint and the biggest
+             cost line. The AI then helped build the justification.
+
+2. Postgres tenant isolation
+   Produced: one shared Postgres with row level security.
+   Did:      chose a schema per tenant, with a database per tenant for
+             high-compliance tenants. A stronger boundary; I accepted harder
+             migrations.
+
+3. Where agent definitions live
+   Produced: versioned rows in Postgres.
+   Did:      chose YAML files: S3 in production, the repo for the PoC. A run
+             pins the definition's hash and copies it into its first event.
+
+4. Orchestration engine
+   Did:      I proposed Temporal for the agent lifecycle. The AI pointed out it
+             would replace the event log and queue we were designing, and make
+             a one-command local run harder. I dropped it for Postgres plus a
+             queue. Here the AI changed my mind; I did not override it.
+
+
+WHERE THE AI CORRECTED ME AND I ACCEPTED IT
+-------------------------------------------
+  - "There would be no estimates in production." Wrong. Output length is never
+    known before a call, so the limiter always reserves input + max_tokens and
+    reconciles to the real usage afterwards.
+  - "Fairness is based on time." Changed to tokens per rolling window: the
+    provider limits tokens and requests, and counting time would let big
+    prompts take more than their share.
+  - "Multiple providers solve head-of-line blocking." Partly. More keys add
+    capacity and shorten waits, but a large request still blocks its own queue.
+  - My first architecture (see entry 11).
+
+
+WHERE AI OUTPUT WAS WRONG, AND HOW IT WAS CAUGHT
+------------------------------------------------
+
+5. A wrong diagnosis of a failing test
+   The noisy neighbour test failed: a quiet tenant's p99 wait was 37 s. The AI
+   blamed the test's bound (it ignored the tenant's own queueing) and rewrote
+   it. I reran the suite and it still failed, at 37.03 s, so I said so and
+   asked for the real fix.
+   The data showed idle arrival waits were bimodal: most under 1 s, a few 25 to
+   37 s. The real cause: against a sliding window, greedy dispatch fills the
+   window in one burst and then stalls until it expires, every window.
+   Fix: a pacer (generic cell rate algorithm) in front of the window, plus a
+   negative control and a new test (T1d) that fails without it.
+
+6. The AI's own limiter design had a flaw
+   Its first design used token buckets at 90% of the limit. While writing the
+   plan it found that a bucket safe against a provider window needs burst
+   capacity under 10% of the limit, which also caps the largest request. It
+   replaced the buckets with a sliding-window accountant.
+   It also retracted an earlier claim that a 40% estimate error breaks the
+   system: reconcile makes completed entries exact, so only in flight requests
+   carry the error. Test T4b was rewritten around the real boundary, a slow
+   provider combined with a large bias.
+
+7. Test thresholds derived wrongly, twice
+   The wait bound ignored a tenant's own queue and used too short a round. The
+   P0 bound (2.81 s) missed two terms and failed at 3.05 s. Both times the fix
+   was to correct the derivation and record it in the test and the plan, not
+   to loosen the number.
+
+8. Negative controls that did not fail the way predicted
+   - In fixed-window mode the unsafe control was refused only 5 times in 664
+     calls, because the cooldown kicked in. The assertion changed from a 10%
+     rate to "the provider must refuse at least one call", and the safe
+     scheduler's assertion became stricter (zero refusals).
+   - The aging control served 24% of low-priority requests, not under 10%. The
+     bounded queue fills with waiting batch work and rejects interactive
+     requests. I recorded it as a known gap (plan issue 29) instead of
+     hiding it.
+   - Forgetting an unknown outcome in the window alone did not fail either: the
+     pacer, never refunded for that call, also kept the rate safe. The control
+     now forgets it in both places. Useful talking point: two independent
+     mechanisms guard the same property.
+   Honest note: several assertions were revised after seeing real numbers. Each
+   revision has its derivation in the test or in plan.md, and the safety claims
+   got stricter, not weaker.
+
+9. Smaller defects surfaced along the way
+   - A float rounding bug: next_free_time and the expiry check could disagree
+     by one ulp and stall a wakeup (found while writing step 3, before any
+     test ran).
+   - A fake-provider key collision on re-sent calls (a KeyError), found by the
+     fault scenario.
+   - Two test files named test_budgets.py broke pytest collection.
+   All fixed.
+
+10. Edits to my own document
+   I hand-edited DESIGN.docx. The AI noticed the edits before overwriting,
+   patched in place, and found that Section 10 had been cut off mid-sentence
+   and restored it.
+
+
+WHERE THE AI BEAT ME
+--------------------
+
+11. Critique of my first architecture
+    My sketch put agent and tools in one pod, with a per-namespace queue. The
+    AI named two major problems: arbitrary code would sit next to the agent's
+    credentials, and a per tenant queue cannot enforce a single global LLM
+    quota. That drove two changes: a separate sandbox with credentials held
+    only in gateways, and one global LLM gateway with per tenant queues in
+    front of the single API key. I would not have seen the global-quota
+    problem on my own, and it is why the rate-limit layer became the slice.
+
+12. Test method
+    Pairing every claim with a broken control, and using a fake provider that
+    never imports the scheduler. That is why the pacer flaw, the quota-check
+    findings and the aging gap surfaced at all.
+
+
+WHAT I DID WITHOUT AI
+---------------------
+  - The first architecture sketch was mine, written before asking for a review.
+  - Running and checking everything. I told the AI not to execute commands
+    during the build. I ran make test and make demo myself, read the output,
+    and pasted failures back.
+  - The decisions in entries 1 to 4, plus Splunk for observability and a
+    namespace per tenant. The AI supplied options and trade-offs.
+
+
+WHAT I WOULD NOT TRUST BLINDLY
+------------------------------
+  The same AI wrote the code and the tests, so the independence of the fake
+  provider matters, and the thresholds are derived but were revised after
+  seeing results. Everything outside the limiter (sandbox, tool gateway,
+  durability) is design only. Time is simulated, so concurrency bugs are not
+  covered. The README lists these under "Known gaps".
+
