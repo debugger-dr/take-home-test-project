@@ -1,10 +1,13 @@
 import heapq
 import math
+from collections import Counter
+from dataclasses import dataclass
 
 from llmgw.budgets import Budget
 from llmgw.config import SchedulerConfig
 from llmgw.events import EventSink, NullSink
 from llmgw.fair_queue import FairQueue, QueuedRequest, RequestQueue
+from llmgw.ledger import LedgerRow, LedgerSink, NullLedger
 from llmgw.p0_lane import P0Lane
 from llmgw.pacer import Pacer
 from llmgw.types import Accepted, Dispatch, Failure, Klass, LLMRequest, Reason, Rejected, Usage
@@ -12,6 +15,23 @@ from llmgw.window import WindowAccountant
 
 MAX_ATTEMPTS = 2
 _EXHAUSTED = {"run": Reason.RUN_BUDGET_EXHAUSTED, "tenant": Reason.TENANT_BUDGET_EXHAUSTED}
+_OUTCOME = {
+    Reason.EXPIRED: "expired",
+    Reason.PROVIDER_ERROR: "provider_error",
+    Reason.RUN_BUDGET_EXHAUSTED: "budget_exhausted",
+    Reason.TENANT_BUDGET_EXHAUSTED: "budget_exhausted",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    queued: dict[str, int]
+    queued_tokens: dict[str, int]
+    in_flight: int
+    token_utilisation: float
+    request_utilisation: float
+    cooling_down: bool
+    rejections: dict[str, int]
 
 
 class Scheduler:
@@ -22,11 +42,13 @@ class Scheduler:
         config: SchedulerConfig,
         queue: RequestQueue | None = None,
         events: EventSink | None = None,
+        ledger: LedgerSink | None = None,
     ) -> None:
         window = config.limits.window
         tolerance = config.pacing_burst * window
         self._config = config
         self._events = events or NullSink()
+        self._ledger = ledger or NullLedger()
         self._queue = queue or FairQueue(config.tenants, config.base_quantum, config.age_p2_to_p1)
         self._p0 = P0Lane([t.name for t in config.tenants], config.p0_rate, config.p0_burst, self._demote)
         self._tokens = WindowAccountant(config.usable_tokens, window)
@@ -46,10 +68,22 @@ class Scheduler:
         self._in_flight: dict[str, QueuedRequest] = {}
         self._deadlines: list[tuple[float, str]] = []
         self._failures: list[Failure] = []
+        self._rejections: Counter[str] = Counter()
         self._cooldown_until = 0.0
 
     def queued(self, tenant: str) -> int:
         return self._queued_len[tenant]
+
+    def snapshot(self, now: float) -> Snapshot:
+        return Snapshot(
+            queued=dict(self._queued_len),
+            queued_tokens=dict(self._queued_tokens),
+            in_flight=len(self._in_flight),
+            token_utilisation=self._tokens.used(now) / self._config.usable_tokens,
+            request_utilisation=self._requests.used(now) / self._config.usable_requests,
+            cooling_down=now < self._cooldown_until,
+            rejections=dict(self._rejections),
+        )
 
     def submit(self, req: LLMRequest, now: float) -> Accepted | Rejected:
         if req.id in self._pending:
@@ -77,6 +111,10 @@ class Scheduler:
         self._pending[req.id] = item
         self._lane_for(item).push(item)
         self._track(item)
+        self._events.emit(
+            "llm.queued", now, request_id=req.id, tenant=req.tenant, klass=int(req.klass),
+            est_wait=round(est_wait, 3), queue_len=self._queued_len[req.tenant],
+        )
         return Accepted(req.id, est_wait)
 
     def cancel(self, request_id: str, now: float) -> bool:
@@ -103,7 +141,7 @@ class Scheduler:
             source.pop(now)
             self._untrack(item)
             if blocked is not None:
-                self._fail(item.request.id, blocked, now)
+                self._fail(item, blocked, now)
                 continue
             if source is self._p0:
                 self._queue.adjust(item.tenant, -item.cost)
@@ -125,6 +163,12 @@ class Scheduler:
         self._token_pace.refund(overcharge)
         self._queue.adjust(item.tenant, overcharge)
         self._adjust_budgets(item, -overcharge)
+        cost = self._record(item, now, "ok", usage)
+        self._events.emit(
+            "llm.completed", now, request_id=request_id, tenant=item.tenant,
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens, cost=cost,
+            input_estimate_error_pct=round(100 * (usage.input_tokens / max(1, item.request.est_input_tokens) - 1), 1),
+        )
 
     def on_provider_rejected(self, request_id: str, retry_after: float, now: float) -> None:
         item = self._in_flight.pop(request_id, None)
@@ -146,7 +190,7 @@ class Scheduler:
             return
         self._events.emit("llm.provider_error", now, request_id=request_id, kind=kind, attempt=item.attempt)
         if item.attempt >= MAX_ATTEMPTS:
-            self._fail(request_id, Reason.PROVIDER_ERROR, now)
+            self._fail(item, Reason.PROVIDER_ERROR, now)
             return
         self._requeue(item)
 
@@ -188,6 +232,7 @@ class Scheduler:
     def _reject(
         self, req: LLMRequest, now: float, reason: Reason, retry_after: float | None = None
     ) -> Rejected:
+        self._rejections[str(reason)] += 1
         self._events.emit("llm.rejected", now, request_id=req.id, tenant=req.tenant, reason=str(reason))
         return Rejected(req.id, reason, retryable=retry_after is not None, retry_after=retry_after)
 
@@ -221,10 +266,30 @@ class Scheduler:
             self._queue.adjust(item.tenant, item.cost)
         self._track(item)
 
-    def _fail(self, request_id: str, reason: Reason, now: float) -> None:
+    def _fail(self, item: QueuedRequest, reason: Reason, now: float) -> None:
+        request_id = item.request.id
         self._pending.pop(request_id, None)
         self._failures.append(Failure(request_id, reason))
-        self._events.emit("llm.failed", now, request_id=request_id, reason=str(reason))
+        self._record(item, now, _OUTCOME[reason])
+        self._events.emit("llm.failed", now, request_id=request_id, tenant=item.tenant, reason=str(reason))
+
+    def _record(self, item: QueuedRequest, now: float, outcome: str, usage: Usage | None = None) -> int:
+        usage = usage or Usage(0, 0)
+        request = item.request
+        cost = self._config.prices.price(usage)
+        left_queue = item.dispatched_at if item.dispatched_at is not None else now
+        self._ledger.record(
+            LedgerRow(
+                id=request.id, tenant=request.tenant, run=request.run, agent=request.agent,
+                model=request.model, klass=int(request.klass), est_input=request.est_input_tokens,
+                max_output=request.max_output_tokens, reserved=item.cost,
+                input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+                cached_tokens=usage.cached_tokens, cost=cost, queue_wait=left_queue - request.submitted_at,
+                attempt=item.attempt, outcome=outcome, ts_submit=request.submitted_at,
+                ts_dispatch=item.dispatched_at, ts_complete=now,
+            )
+        )
+        return cost
 
     def _expire(self, now: float) -> None:
         while self._deadlines and self._deadlines[0][0] <= now:
@@ -234,7 +299,7 @@ class Scheduler:
                 continue
             self._lane_for(item).remove(item)
             self._untrack(item)
-            self._fail(request_id, Reason.EXPIRED, now)
+            self._fail(item, Reason.EXPIRED, now)
 
     def _next_deadline(self) -> float | None:
         while self._deadlines:
@@ -278,7 +343,12 @@ class Scheduler:
         self._requests.reserve(item.key, 1, now)
         self._token_pace.commit(item.cost, now)
         self._request_pace.commit(1, now)
+        item.dispatched_at = now
         self._in_flight[item.request.id] = item
+        self._events.emit(
+            "llm.dispatched", now, request_id=item.request.id, tenant=item.tenant, attempt=item.attempt,
+            queue_wait=round(now - item.request.submitted_at, 3), window_tokens_used=self._tokens.used(now),
+        )
         for scope, budget in self._budgets(item.request):
             if budget.commit(item.cost):
                 self._events.emit(

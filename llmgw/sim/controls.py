@@ -156,6 +156,14 @@ class NoQuotaScheduler(Scheduler):
         return True
 
 
+class ReservationBillingScheduler(Scheduler):
+    """Negative control: bills what it reserved instead of what the provider reports was used."""
+
+    def on_complete(self, request_id: str, usage: Usage, now: float) -> None:
+        item = self._in_flight.get(request_id)
+        super().on_complete(request_id, Usage(item.cost, 0) if item is not None else usage, now)
+
+
 class NoCooldownScheduler(Scheduler):
     """Negative control: keeps dispatching straight into a provider that is refusing everything."""
 

@@ -1,5 +1,6 @@
+import json
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Protocol, TextIO
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +17,17 @@ class EventSink(Protocol):
 class NullSink:
     def emit(self, name: str, now: float, **fields: object) -> None:
         pass
+
+
+class JsonLinesSink:
+    """One JSON object per line, ready to ship to a log pipeline."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+
+    def emit(self, name: str, now: float, **fields: object) -> None:
+        record = {"event": name, "ts": round(now, 6), **fields}
+        self._stream.write(json.dumps(record, default=str) + "\n")
 
 
 class MemorySink:

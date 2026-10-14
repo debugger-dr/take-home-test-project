@@ -1,6 +1,8 @@
 import math
 from dataclasses import dataclass
 
+from llmgw.types import Usage
+
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
@@ -35,6 +37,20 @@ class TenantConfig:
 
 
 @dataclass(frozen=True)
+class PriceTable:
+    """Illustrative prices in micro-dollars per token; integers keep every total exact."""
+
+    input_micros: int = 3
+    output_micros: int = 15
+
+    def __post_init__(self) -> None:
+        _require(self.input_micros >= 0 and self.output_micros >= 0, "prices must not be negative")
+
+    def price(self, usage: Usage) -> int:
+        return usage.input_tokens * self.input_micros + usage.output_tokens * self.output_micros
+
+
+@dataclass(frozen=True)
 class SchedulerConfig:
     limits: ProviderLimits
     tenants: tuple[TenantConfig, ...]
@@ -49,6 +65,7 @@ class SchedulerConfig:
     max_queue_tokens: int = 1_000_000
     run_token_cap: int | None = None
     budget_alert: float = 0.8
+    prices: PriceTable = PriceTable()
 
     def __post_init__(self) -> None:
         names = [t.name for t in self.tenants]

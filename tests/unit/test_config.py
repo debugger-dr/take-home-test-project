@@ -1,6 +1,7 @@
 import pytest
 
-from llmgw.config import ProviderLimits, SchedulerConfig, TenantConfig
+from llmgw.config import PriceTable, ProviderLimits, SchedulerConfig, TenantConfig
+from llmgw.types import Usage
 
 LIMITS = ProviderLimits(rpm=600, tpm=400_000)
 TENANTS = (TenantConfig("a"), TenantConfig("b"))
@@ -43,6 +44,15 @@ def test_invalid_provider_limits_are_rejected(rpm, tpm, window):
 def test_non_positive_weight_is_rejected(weight):
     with pytest.raises(ValueError):
         TenantConfig("a", weight=weight)
+
+
+def test_price_table_prices_input_and_output_separately_in_whole_units():
+    assert PriceTable(input_micros=3, output_micros=15).price(Usage(input_tokens=100, output_tokens=10)) == 450
+
+
+def test_negative_prices_are_rejected():
+    with pytest.raises(ValueError):
+        PriceTable(input_micros=-1)
 
 
 def test_non_positive_tenant_budget_is_rejected():

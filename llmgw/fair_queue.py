@@ -14,6 +14,7 @@ class QueuedRequest:
     klass: Klass
     enqueued_at: float
     attempt: int = 1
+    dispatched_at: float | None = None
 
     @classmethod
     def of(cls, request: LLMRequest, cost: int, now: float) -> "QueuedRequest":

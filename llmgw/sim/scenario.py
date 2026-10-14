@@ -24,6 +24,7 @@ class Scenario:
     weights: Mapping[str, int] = field(default_factory=dict)
     budgets: Mapping[str, int] = field(default_factory=dict)
     settings: Mapping[str, object] = field(default_factory=dict)
+    provider: Mapping[str, object] = field(default_factory=dict)
     counting: CountingMode = CountingMode.RESERVE_AT_START
     window_mode: WindowMode = WindowMode.ROLLING
     fault_rate: float = 0.0
@@ -49,7 +50,8 @@ class Scenario:
     def run(self, make_scheduler: Callable[[SchedulerConfig], SchedulerPort] = Scheduler) -> Report:
         requests = Workload(self.profiles, self.seed).generate(self.duration)
         model = ProviderModel(
-            self.limits, self.counting, self.window_mode, fault_rate=self.fault_rate, outage=self.outage
+            self.limits, self.counting, self.window_mode,
+            fault_rate=self.fault_rate, outage=self.outage, **self.provider,
         )
         provider = FakeProvider(model, random.Random(self.seed + 1))
         scheduler = make_scheduler(self.scheduler_config())

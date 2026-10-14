@@ -74,6 +74,14 @@ def test_served_ratio_counts_only_accepted_requests():
     assert report.served_ratio("a", 0, 100, Klass.P1) == 0.5
 
 
+def test_fingerprint_is_stable_and_changes_when_anything_changes():
+    def report(tokens: int) -> Report:
+        return Report({"r": RequestRecord("a", Klass.P1, 1.0, completed_at=2.0, tokens=tokens)}, STATS, 10.0)
+
+    assert report(100).fingerprint() == report(100).fingerprint()
+    assert report(100).fingerprint() != report(101).fingerprint()
+
+
 def test_max_dispatch_gap_only_considers_dispatches_inside_the_window():
     times = [1, 2, 5, 6, 40]
     records = {str(i): record(submitted=0, dispatched=t) for i, t in enumerate(times)}

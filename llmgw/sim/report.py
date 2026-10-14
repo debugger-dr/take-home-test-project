@@ -1,3 +1,4 @@
+import hashlib
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -69,6 +70,18 @@ class Report:
         if record.dispatched_at is not None:
             return record.dispatched_at
         return record.failed_at if record.failed_at is not None else self.horizon
+
+    def fingerprint(self) -> str:
+        """Hash of everything that happened, for checking that two runs were identical."""
+        digest = hashlib.sha256()
+        for request_id in sorted(self.records):
+            r = self.records[request_id]
+            digest.update(repr((
+                request_id, r.tenant, int(r.klass), r.submitted_at, r.dispatched_at, r.completed_at,
+                r.tokens, r.throttled, r.rejected, r.failed, r.failed_at, r.submissions, r.faulted,
+            )).encode())
+        digest.update(repr(self.provider).encode())
+        return digest.hexdigest()
 
     def max_dispatch_gap(self, start: float, end: float) -> float:
         times = sorted(

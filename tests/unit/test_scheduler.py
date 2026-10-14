@@ -4,6 +4,7 @@ from llmgw.config import ProviderLimits, SchedulerConfig, TenantConfig
 from llmgw.scheduler import Scheduler
 from llmgw.sim.controls import FifoQueue
 from llmgw.events import MemorySink
+from llmgw.ledger import Ledger, Spend
 from llmgw.types import Accepted, Failure, Klass, Reason, Rejected, Usage
 
 
@@ -348,6 +349,85 @@ def test_p0_demotion_is_reported_as_an_event(req):
         scheduler.submit(req(name, klass=Klass.P0), now=0)
     scheduler.poll(0)
     assert [e.fields["request_id"] for e in sink.named("llm.p0_demoted")] == ["p0c", "p0d"]
+
+
+def test_completion_is_billed_from_what_the_provider_reports(req):
+    ledger = Ledger()
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",)), ledger=ledger)
+    scheduler.submit(req("r1"), now=0)
+    scheduler.poll(2.0)
+    scheduler.on_complete("r1", Usage(input_tokens=150, output_tokens=50), now=5.0)
+    assert ledger.total() == Spend(tokens=200, cost=150 * 3 + 50 * 15, requests=1)
+    assert ledger.outcomes() == {"ok": 1}
+
+
+def test_a_budget_failure_is_recorded_with_its_outcome_and_no_tokens(req):
+    ledger = Ledger()
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",), run_token_cap=300), ledger=ledger)
+    scheduler.submit(req("fits", cost=300), now=0)
+    scheduler.submit(req("over-cap", cost=300), now=0)
+    scheduler.poll(0)
+    assert ledger.outcomes() == {"budget_exhausted": 1}
+    assert ledger.total().tokens == 0
+
+
+def test_an_expiry_is_recorded_with_its_outcome_and_no_tokens(req, make_request):
+    ledger = Ledger()
+    scheduler = Scheduler(make_config(tpm=1_000, tenants=("a",)), ledger=ledger)
+    scheduler.submit(req("filler", cost=1_000), now=0)
+    scheduler.poll(0)
+    scheduler.submit(make_request(id="late", est_input=300, max_output=100, deadline=5.0), now=0)
+    scheduler.poll(5.0)
+    assert ledger.outcomes() == {"expired": 1}
+    assert ledger.total().tokens == 0
+
+
+def test_a_request_that_needed_a_retry_is_billed_once(req):
+    ledger = Ledger()
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",)), ledger=ledger)
+    scheduler.submit(req("r1"), now=0)
+    scheduler.poll(0)
+    scheduler.on_provider_error("r1", "timeout", now=1)
+    scheduler.poll(1)
+    scheduler.on_complete("r1", Usage(input_tokens=100, output_tokens=100), now=2)
+    assert ledger.total().requests == 1
+    assert ledger.total().tokens == 200
+
+
+def test_lifecycle_events_carry_the_numbers_an_operator_needs(req):
+    sink = MemorySink()
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",)), events=sink)
+    scheduler.submit(req("r1"), now=0)
+    scheduler.poll(2.0)
+    scheduler.on_complete("r1", Usage(input_tokens=150, output_tokens=50), now=5.0)
+
+    queued, = sink.named("llm.queued")
+    dispatched, = sink.named("llm.dispatched")
+    completed, = sink.named("llm.completed")
+    assert queued.fields["queue_len"] == 1
+    assert dispatched.fields["queue_wait"] == 2.0
+    assert dispatched.fields["window_tokens_used"] == 200
+    assert completed.fields["cost"] == 150 * 3 + 50 * 15
+    assert completed.fields["input_estimate_error_pct"] == 50.0
+
+
+def test_snapshot_shows_queues_utilisation_and_rejections(req):
+    scheduler = Scheduler(make_config(tpm=1_000, tenants=("a",)))
+    scheduler.submit(req("r1", cost=500), now=0)
+    scheduler.submit(req("r2", cost=500), now=0)
+    scheduler.submit(req("r3", cost=2_000), now=0)
+    scheduler.poll(0)
+
+    snap = scheduler.snapshot(0)
+    assert snap.in_flight == 2
+    assert snap.queued == {"a": 0}
+    assert snap.token_utilisation == pytest.approx(1.0)
+    assert snap.rejections == {"too_large": 1}
+    assert not snap.cooling_down
+
+    scheduler.on_provider_rejected("r1", retry_after=5.0, now=1.0)
+    assert scheduler.snapshot(2.0).cooling_down
+    assert scheduler.snapshot(2.0).queued == {"a": 1}
 
 
 def test_fair_queue_interleaves_tenants_while_fifo_does_not(req):
