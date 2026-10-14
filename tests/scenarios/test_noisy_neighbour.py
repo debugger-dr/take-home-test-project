@@ -63,7 +63,7 @@ def test_saturated_provider_is_fed_smoothly_without_stop_and_go(noisy):
 
 def test_fifo_control_makes_quiet_tenants_wait_behind_the_flood(noisy):
     report = noisy.run(fifo_scheduler)
-    assert p99_wait(noisy, report, "b") > 10 * WAIT_BOUND
+    assert p99_wait(noisy, report, "b") > WAIT_BOUND
 
 
 def test_tenant_above_its_share_receives_exactly_its_max_min_share():

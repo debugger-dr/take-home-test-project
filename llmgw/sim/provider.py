@@ -1,3 +1,4 @@
+import itertools
 import random
 from collections import deque
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ class ProviderModel:
     latency_jitter: float = 0.0
     input_ratio: tuple[float, float] = (0.85, 1.15)
     output_ratio: tuple[float, float] = (0.3, 1.0)
+    fault_rate: float = 0.0
+    outage: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +53,13 @@ class Started:
 
 
 @dataclass(frozen=True, slots=True)
+class Faulted:
+    """The call was counted by the provider but its outcome never reached the caller."""
+
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderStats:
     accepted: int
     throttled: int
@@ -57,6 +67,7 @@ class ProviderStats:
     total_output_tokens: int
     peak_tokens: int
     peak_requests: int
+    faulted: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -159,9 +170,11 @@ class FakeProvider:
         self._rng = rng
         self._tokens: _Counter = counter(model.limits.window)
         self._requests: _Counter = counter(model.limits.window)
-        self._in_flight: dict[str, Usage] = {}
+        self._in_flight: dict[str, tuple[str, Usage]] = {}
+        self._sequence = itertools.count()
         self._accepted = 0
         self._throttled = 0
+        self._faulted = 0
         self._total_input = 0
         self._total_output = 0
 
@@ -174,9 +187,15 @@ class FakeProvider:
             total_output_tokens=self._total_output,
             peak_tokens=self._tokens.peak,
             peak_requests=self._requests.peak,
+            faulted=self._faulted,
         )
 
-    def send(self, call: ProviderCall, now: float) -> Started | Throttled:
+    def send(self, call: ProviderCall, now: float) -> Started | Throttled | Faulted:
+        outage = self._model.outage
+        if outage is not None and outage[0] <= now < outage[1]:
+            self._throttled += 1
+            return Throttled(outage[1] - now)
+
         usage = self._draw_usage(call)
         reserved = self._reserved_tokens(call, usage)
         limits = self._model.limits
@@ -191,19 +210,23 @@ class FakeProvider:
                 waits.append(self._requests.retry_after(1, limits.rpm, now))
             return Throttled(max(waits))
 
+        key = f"{call.id}#{next(self._sequence)}"
         if reserved:
-            self._tokens.add(call.id, reserved, now)
-        self._requests.add(call.id, 1, now)
-        self._in_flight[call.id] = usage
+            self._tokens.add(key, reserved, now)
+        self._requests.add(key, 1, now)
         self._accepted += 1
+        if self._model.fault_rate and self._rng.random() < self._model.fault_rate:
+            self._faulted += 1
+            return Faulted("server_error")
+        self._in_flight[call.id] = (key, usage)
         return Started(call.id, now + self._latency(usage), usage)
 
     def finish(self, request_id: str, now: float) -> Usage:
-        usage = self._in_flight.pop(request_id)
+        key, usage = self._in_flight.pop(request_id)
         if self._model.counting is CountingMode.RESERVE_AT_START:
-            self._tokens.adjust(request_id, usage.total)
+            self._tokens.adjust(key, usage.total)
         else:
-            self._tokens.add(request_id, usage.total, now)
+            self._tokens.add(key, usage.total, now)
         self._total_input += usage.input_tokens
         self._total_output += usage.output_tokens
         return usage

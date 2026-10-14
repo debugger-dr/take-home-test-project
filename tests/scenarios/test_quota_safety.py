@@ -27,15 +27,15 @@ def scenario(profiles, counting=CountingMode.RESERVE_AT_START, window_mode=Windo
 @pytest.mark.parametrize("window_mode", list(WindowMode))
 def test_provider_is_never_pushed_over_its_token_limit(counting, window_mode):
     stats = scenario(TOKEN_BOUND, counting, window_mode).run().provider
-    assert stats.throttle_rate <= 0.01
+    assert stats.throttled == 0
     assert stats.peak_tokens <= LIMITS.tpm
     assert stats.peak_requests <= LIMITS.rpm
 
 
 @pytest.mark.parametrize("window_mode", list(WindowMode))
-def test_control_without_quota_check_is_throttled(window_mode):
+def test_control_without_quota_check_makes_the_provider_refuse_calls(window_mode):
     sc = scenario(TOKEN_BOUND, window_mode=window_mode)
-    assert sc.run(NoQuotaScheduler).provider.throttle_rate > 0.10
+    assert sc.run(NoQuotaScheduler).provider.throttled > 0
 
 
 @pytest.mark.parametrize("window_mode", list(WindowMode))
@@ -43,12 +43,12 @@ def test_provider_is_never_pushed_over_its_request_limit(window_mode):
     sc = scenario(REQUEST_BOUND, window_mode=window_mode)
     report = sc.run()
     start, end = sc.measure
-    assert report.provider.throttle_rate <= 0.01
+    assert report.provider.throttled == 0
     assert report.provider.peak_requests <= LIMITS.rpm
     assert report.requests_per_minute("a", start, end) >= 0.9 * int(LIMITS.rpm * 0.9)
 
 
 @pytest.mark.parametrize("window_mode", list(WindowMode))
-def test_request_bound_control_without_quota_check_is_throttled(window_mode):
+def test_request_bound_control_without_quota_check_makes_the_provider_refuse_calls(window_mode):
     sc = scenario(REQUEST_BOUND, window_mode=window_mode)
-    assert sc.run(NoQuotaScheduler).provider.throttle_rate > 0.10
+    assert sc.run(NoQuotaScheduler).provider.throttled > 0

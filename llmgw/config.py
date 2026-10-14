@@ -23,10 +23,15 @@ class ProviderLimits:
 class TenantConfig:
     name: str
     weight: int = 1
+    token_budget: int | None = None
 
     def __post_init__(self) -> None:
         _require(bool(self.name), "tenant name must not be empty")
         _require(self.weight > 0, f"tenant {self.name!r}: weight must be positive")
+        _require(
+            self.token_budget is None or self.token_budget > 0,
+            f"tenant {self.name!r}: token_budget must be positive",
+        )
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,10 @@ class SchedulerConfig:
     age_p2_to_p1: float = 30.0
     p0_rate: float = 300.0
     p0_burst: int = 8_000
+    max_queue_len: int = 200
+    max_queue_tokens: int = 1_000_000
+    run_token_cap: int | None = None
+    budget_alert: float = 0.8
 
     def __post_init__(self) -> None:
         names = [t.name for t in self.tenants]
@@ -51,6 +60,9 @@ class SchedulerConfig:
         _require(0 <= self.pacing_burst <= 1, "pacing_burst must be in [0, 1]")
         _require(self.age_p2_to_p1 > 0, "age_p2_to_p1 must be positive")
         _require(self.p0_rate > 0 and self.p0_burst > 0, "p0_rate and p0_burst must be positive")
+        _require(self.max_queue_len > 0 and self.max_queue_tokens > 0, "queue bounds must be positive")
+        _require(self.run_token_cap is None or self.run_token_cap > 0, "run_token_cap must be positive")
+        _require(0 < self.budget_alert <= 1, "budget_alert must be in (0, 1]")
 
     @property
     def usable_tokens(self) -> int:

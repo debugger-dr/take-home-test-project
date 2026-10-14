@@ -1,19 +1,22 @@
 import heapq
 import itertools
+import random
 from collections.abc import Sequence
 from enum import IntEnum
 from typing import Protocol
 
-from llmgw.sim.provider import FakeProvider, ProviderCall, Started, Throttled
+from llmgw.sim.provider import FakeProvider, Faulted, ProviderCall, Started, Throttled
 from llmgw.sim.report import Report, RequestRecord
-from llmgw.types import Accepted, Dispatch, LLMRequest, Rejected, Usage
+from llmgw.types import Accepted, Dispatch, Failure, LLMRequest, Rejected, Usage
 
 
 class SchedulerPort(Protocol):
     def submit(self, req: LLMRequest, now: float) -> Accepted | Rejected: ...
     def poll(self, now: float) -> list[Dispatch]: ...
+    def take_failures(self) -> list[Failure]: ...
     def on_complete(self, request_id: str, usage: Usage, now: float) -> None: ...
     def on_provider_rejected(self, request_id: str, retry_after: float, now: float) -> None: ...
+    def on_provider_error(self, request_id: str, kind: str, now: float) -> None: ...
     def next_wakeup(self, now: float) -> float | None: ...
 
 
@@ -24,11 +27,25 @@ class _Kind(IntEnum):
 
 
 class Simulator:
-    """Discrete-event driver: time only advances to the next event, so a long scenario runs instantly."""
+    """Discrete-event driver: time only advances to the next event, so a long scenario runs instantly.
 
-    def __init__(self, scheduler: SchedulerPort, provider: FakeProvider) -> None:
+    Callers whose submission is rejected with a retry hint come back after that hint plus random jitter,
+    up to max_attempts submissions in total.
+    """
+
+    def __init__(
+        self,
+        scheduler: SchedulerPort,
+        provider: FakeProvider,
+        rng: random.Random | None = None,
+        max_attempts: int = 1,
+        retry_jitter: float = 1.0,
+    ) -> None:
         self._scheduler = scheduler
         self._provider = provider
+        self._rng = rng or random.Random(0)
+        self._max_attempts = max_attempts
+        self._retry_jitter = retry_jitter
         self._events: list[tuple[float, int, _Kind, str]] = []
         self._sequence = itertools.count()
         self._requests: dict[str, LLMRequest] = {}
@@ -55,11 +72,23 @@ class Simulator:
         heapq.heappush(self._events, (at, next(self._sequence), kind, key))
 
     def _arrive(self, request: LLMRequest, now: float) -> None:
-        record = RequestRecord(request.tenant, request.klass, now)
-        self._records[request.id] = record
+        record = self._records.get(request.id)
+        if record is None:
+            record = RequestRecord(request.tenant, request.klass, request.submitted_at, run=request.run)
+            self._records[request.id] = record
+        record.submissions += 1
         result = self._scheduler.submit(request, now)
         if isinstance(result, Rejected):
             record.rejected = result.reason
+            self._schedule_retry(request, result, record, now)
+        else:
+            record.rejected = None
+
+    def _schedule_retry(self, request: LLMRequest, result: Rejected, record: RequestRecord, now: float) -> None:
+        if not result.retryable or result.retry_after is None or record.submissions >= self._max_attempts:
+            return
+        delay = result.retry_after * (1 + self._retry_jitter * self._rng.random())
+        self._push(now + delay, _Kind.ARRIVAL, request.id)
 
     def _complete(self, request_id: str, now: float) -> None:
         usage = self._provider.finish(request_id, now)
@@ -71,6 +100,10 @@ class Simulator:
     def _dispatch_ready(self, now: float) -> None:
         for dispatch in self._scheduler.poll(now):
             self._send(dispatch, now)
+        for failure in self._scheduler.take_failures():
+            record = self._records[failure.id]
+            record.failed = failure.reason
+            record.failed_at = now
         wakeup = self._scheduler.next_wakeup(now)
         if wakeup is not None and wakeup > now and wakeup != self._wakeup_at:
             self._wakeup_at = wakeup
@@ -86,5 +119,8 @@ class Simulator:
         if isinstance(outcome, Throttled):
             record.throttled += 1
             self._scheduler.on_provider_rejected(request.id, outcome.retry_after, now)
+        elif isinstance(outcome, Faulted):
+            record.faulted += 1
+            self._scheduler.on_provider_error(request.id, outcome.kind, now)
         elif isinstance(outcome, Started):
             self._push(outcome.finish_at, _Kind.COMPLETE, request.id)

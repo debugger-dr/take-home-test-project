@@ -16,6 +16,11 @@ class RequestRecord:
     tokens: int = 0
     throttled: int = 0
     rejected: Reason | None = None
+    failed: Reason | None = None
+    failed_at: float | None = None
+    submissions: int = 0
+    faulted: int = 0
+    run: str = ""
 
 
 def percentile(values: Sequence[float], p: float) -> float:
@@ -33,23 +38,37 @@ class Report:
     horizon: float
 
     def waits(self, tenant: str, start: float, end: float, klass: Klass | None = None) -> list[float]:
-        """Queue wait of requests submitted in [start, end); undispatched ones are counted up to the horizon."""
+        """Queue wait of accepted requests submitted in [start, end); a request still waiting counts up to its failure or the horizon."""
         return [
-            (r.dispatched_at if r.dispatched_at is not None else self.horizon) - r.submitted_at
+            self._left_queue_at(r) - r.submitted_at
             for r in self._submitted(tenant, start, end, klass)
+            if r.rejected is None
         ]
 
     def waits_when_idle(self, tenant: str, start: float, end: float) -> list[float]:
         """Waits of requests that arrived while none of the tenant's earlier requests was still queued."""
-        own = sorted((r for r in self.records.values() if r.tenant == tenant), key=lambda r: r.submitted_at)
+        own = sorted(
+            (r for r in self.records.values() if r.tenant == tenant and r.rejected is None),
+            key=lambda r: r.submitted_at,
+        )
         waits: list[float] = []
         drained_at = -math.inf
         for record in own:
-            dispatched = record.dispatched_at if record.dispatched_at is not None else self.horizon
+            left = self._left_queue_at(record)
             if start <= record.submitted_at < end and drained_at <= record.submitted_at:
-                waits.append(dispatched - record.submitted_at)
-            drained_at = max(drained_at, dispatched)
+                waits.append(left - record.submitted_at)
+            drained_at = max(drained_at, left)
         return waits
+
+    def served_ratio(self, tenant: str, start: float, end: float, klass: Klass | None = None) -> float:
+        """Share of accepted requests that completed."""
+        accepted = [r for r in self._submitted(tenant, start, end, klass) if r.rejected is None]
+        return sum(r.completed_at is not None for r in accepted) / len(accepted)
+
+    def _left_queue_at(self, record: RequestRecord) -> float:
+        if record.dispatched_at is not None:
+            return record.dispatched_at
+        return record.failed_at if record.failed_at is not None else self.horizon
 
     def max_dispatch_gap(self, start: float, end: float) -> float:
         times = sorted(

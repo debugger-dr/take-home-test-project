@@ -45,6 +45,12 @@ def test_non_positive_weight_is_rejected(weight):
         TenantConfig("a", weight=weight)
 
 
+def test_non_positive_tenant_budget_is_rejected():
+    with pytest.raises(ValueError):
+        TenantConfig("a", token_budget=0)
+    assert TenantConfig("a", token_budget=None).token_budget is None
+
+
 def test_empty_tenant_name_is_rejected():
     with pytest.raises(ValueError):
         TenantConfig("")
@@ -72,6 +78,11 @@ def test_tenant_names_must_be_unique():
         ("age_p2_to_p1", 0),
         ("p0_rate", 0),
         ("p0_burst", 0),
+        ("max_queue_len", 0),
+        ("max_queue_tokens", 0),
+        ("run_token_cap", 0),
+        ("budget_alert", 0),
+        ("budget_alert", 1.5),
     ],
 )
 def test_invalid_scheduler_settings_are_rejected(field, value):

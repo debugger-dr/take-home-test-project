@@ -15,6 +15,8 @@ class Reason(StrEnum):
     TENANT_BUDGET_EXHAUSTED = "tenant_budget_exhausted"
     QUEUE_FULL = "queue_full"
     WAIT_EXCEEDS_DEADLINE = "wait_exceeds_deadline"
+    EXPIRED = "expired"
+    PROVIDER_ERROR = "provider_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,12 @@ class Rejected:
     reason: Reason
     retryable: bool
     retry_after: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Failure:
+    id: str
+    reason: Reason
 
 
 @dataclass(frozen=True, slots=True)

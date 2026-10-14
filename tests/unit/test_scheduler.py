@@ -3,15 +3,17 @@ import pytest
 from llmgw.config import ProviderLimits, SchedulerConfig, TenantConfig
 from llmgw.scheduler import Scheduler
 from llmgw.sim.controls import FifoQueue
-from llmgw.types import Accepted, Klass, Reason, Rejected, Usage
+from llmgw.events import MemorySink
+from llmgw.types import Accepted, Failure, Klass, Reason, Rejected, Usage
 
 
 def make_config(
-    tpm=1_000, rpm=100, tenants=("a", "b"), quantum=10_000, pacing_burst=1.0, **settings
+    tpm=1_000, rpm=100, tenants=("a", "b"), quantum=10_000, pacing_burst=1.0, budgets=None, **settings
 ) -> SchedulerConfig:
+    budgets = budgets or {}
     return SchedulerConfig(
         limits=ProviderLimits(rpm=rpm, tpm=tpm, window=10.0),
-        tenants=tuple(TenantConfig(t) for t in tenants),
+        tenants=tuple(TenantConfig(t, token_budget=budgets.get(t)) for t in tenants),
         headroom=1.0,
         input_safety=1.0,
         base_quantum=quantum,
@@ -176,6 +178,176 @@ def test_rejected_p0_returns_to_the_front_of_the_p0_lane(req):
     retried = scheduler.poll(2.0)
     assert ids(retried) == ["p0", "late"]
     assert retried[0].attempt == 2
+
+
+def test_queue_length_bound_rejects_with_a_retry_hint(req):
+    scheduler = Scheduler(make_config(tpm=10_000, max_queue_len=2))
+    for i in (1, 2):
+        scheduler.submit(req(f"r{i}"), now=0)
+    result = scheduler.submit(req("r3"), now=0)
+    assert isinstance(result, Rejected)
+    assert (result.reason, result.retryable) == (Reason.QUEUE_FULL, True)
+    assert result.retry_after == pytest.approx(0.2)
+
+
+def test_queued_token_bound_rejects_when_the_next_request_would_exceed_it(req):
+    scheduler = Scheduler(make_config(tpm=10_000, max_queue_tokens=500))
+    scheduler.submit(req("r1"), now=0)
+    scheduler.submit(req("r2"), now=0)
+    result = scheduler.submit(req("r3"), now=0)
+    assert isinstance(result, Rejected) and result.reason is Reason.QUEUE_FULL
+
+
+def test_request_that_cannot_be_served_before_its_deadline_is_rejected_with_a_hint(make_request):
+    scheduler = Scheduler(make_config(tpm=1_000))
+    scheduler.submit(make_request(id="queued", est_input=300, max_output=100), now=0)
+    late = scheduler.submit(make_request(id="late", est_input=300, max_output=100, deadline=5.0), now=0)
+    assert isinstance(late, Rejected)
+    assert (late.reason, late.retryable) == (Reason.WAIT_EXCEEDS_DEADLINE, True)
+    assert late.retry_after == pytest.approx(3.0)
+
+
+def test_accepted_request_reports_its_estimated_wait(make_request):
+    scheduler = Scheduler(make_config(tpm=1_000))
+    scheduler.submit(make_request(id="queued", est_input=300, max_output=100), now=0)
+    result = scheduler.submit(make_request(id="next", est_input=300, max_output=100, deadline=10.0), now=0)
+    assert isinstance(result, Accepted)
+    assert result.est_wait == pytest.approx(8.0)
+
+
+def test_estimated_wait_shrinks_when_the_tenants_share_grows(make_request):
+    busy = Scheduler(make_config(tpm=1_000))
+    busy.submit(make_request(id="other", tenant="b", est_input=300, max_output=100), now=0)
+    shared = busy.submit(make_request(id="mine", tenant="a", est_input=300, max_output=100, deadline=50), now=0)
+    alone = Scheduler(make_config(tpm=1_000)).submit(
+        make_request(id="mine", tenant="a", est_input=300, max_output=100, deadline=50), now=0
+    )
+    assert shared.est_wait == pytest.approx(2 * alone.est_wait)
+
+
+def test_p0_requests_are_not_rejected_for_an_estimated_wait(make_request):
+    scheduler = Scheduler(make_config(tpm=1_000))
+    scheduler.submit(make_request(id="queued", est_input=300, max_output=100), now=0)
+    urgent = make_request(id="urgent", est_input=300, max_output=100, klass=Klass.P0, deadline=5.0)
+    assert isinstance(scheduler.submit(urgent, now=0), Accepted)
+
+
+def test_request_whose_deadline_has_passed_is_rejected_permanently(make_request):
+    result = Scheduler(make_config()).submit(make_request(id="old", deadline=3.0), now=3.0)
+    assert isinstance(result, Rejected)
+    assert (result.reason, result.retryable) == (Reason.EXPIRED, False)
+
+
+def test_queued_request_expires_at_its_deadline(req, make_request):
+    scheduler = Scheduler(make_config(tpm=1_000))
+    scheduler.submit(req("r1", cost=1_000), now=0)
+    assert ids(scheduler.poll(0)) == ["r1"]
+    scheduler.submit(make_request(id="r2", est_input=300, max_output=100, deadline=5.0), now=0)
+    assert scheduler.next_wakeup(0) == 5.0
+
+    assert scheduler.poll(5.0) == []
+    assert scheduler.take_failures() == [Failure("r2", Reason.EXPIRED)]
+    assert scheduler.take_failures() == []
+    assert scheduler.queued("a") == 0
+    assert scheduler.poll(10.0) == []
+
+
+def test_cancel_removes_a_queued_request_but_not_one_in_flight(req):
+    sink = MemorySink()
+    scheduler = Scheduler(make_config(tpm=1_000), events=sink)
+    scheduler.submit(req("r1", cost=1_000), now=0)
+    scheduler.submit(req("r2", cost=400), now=0)
+    assert ids(scheduler.poll(0)) == ["r1"]
+
+    assert not scheduler.cancel("r1", now=1)
+    assert scheduler.cancel("r2", now=1)
+    assert not scheduler.cancel("r2", now=1)
+    assert not scheduler.cancel("missing", now=1)
+    assert scheduler.queued("a") == 0
+    assert scheduler.poll(10.0) == []
+    assert len(sink.named("llm.cancelled")) == 1
+
+
+def test_unknown_outcome_keeps_the_reservation_and_retries_after_it_ages_out(req):
+    scheduler = Scheduler(make_config(tpm=1_000, tenants=("a",)))
+    scheduler.submit(req("r1", cost=600), now=0)
+    assert ids(scheduler.poll(0)) == ["r1"]
+
+    scheduler.on_provider_error("r1", "timeout", now=1.0)
+    assert scheduler.poll(1.0) == []
+    assert scheduler.next_wakeup(1.0) == 10.0
+    retried = scheduler.poll(10.0)
+    assert ids(retried) == ["r1"]
+    assert retried[0].attempt == 2
+
+
+def test_second_unknown_outcome_is_a_terminal_failure(req):
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",)))
+    scheduler.submit(req("r1"), now=0)
+    scheduler.poll(0)
+    scheduler.on_provider_error("r1", "timeout", now=1)
+    assert ids(scheduler.poll(1)) == ["r1"]
+
+    scheduler.on_provider_error("r1", "timeout", now=2)
+    assert scheduler.take_failures() == [Failure("r1", Reason.PROVIDER_ERROR)]
+    assert scheduler.poll(3) == []
+
+
+def test_tenant_budget_alerts_once_and_blocks_dispatch_that_would_exceed_it(req):
+    sink = MemorySink()
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",), budgets={"a": 1_000}), events=sink)
+    for i in (1, 2, 3):
+        scheduler.submit(req(f"r{i}", cost=400), now=0)
+    assert ids(scheduler.poll(0)) == ["r1", "r2"]
+    assert scheduler.take_failures() == [Failure("r3", Reason.TENANT_BUDGET_EXHAUSTED)]
+    alerts = sink.named("llm.budget_alert")
+    assert len(alerts) == 1
+    assert alerts[0].fields["scope"] == "tenant"
+
+
+def test_exhausted_tenant_budget_rejects_new_requests_permanently(req):
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",), budgets={"a": 800}))
+    for i in (1, 2):
+        scheduler.submit(req(f"r{i}", cost=400), now=0)
+    scheduler.poll(0)
+    result = scheduler.submit(req("r3", cost=400), now=1)
+    assert isinstance(result, Rejected)
+    assert (result.reason, result.retryable) == (Reason.TENANT_BUDGET_EXHAUSTED, False)
+
+
+def test_completion_returns_budget_that_was_reserved_but_not_used(req):
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",), budgets={"a": 1_000}))
+    scheduler.submit(req("r1", cost=800), now=0)
+    scheduler.poll(0)
+    scheduler.on_complete("r1", Usage(input_tokens=100, output_tokens=100), now=1)
+    scheduler.submit(req("r2", cost=800), now=1)
+    assert ids(scheduler.poll(1)) == ["r2"]
+
+
+def test_provider_rejection_returns_the_budget_for_a_request_that_was_not_served(req):
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",), budgets={"a": 1_000}))
+    scheduler.submit(req("r1", cost=800), now=0)
+    scheduler.poll(0)
+    scheduler.on_provider_rejected("r1", retry_after=1.0, now=0.5)
+    assert ids(scheduler.poll(2.0)) == ["r1"]
+    assert scheduler.take_failures() == []
+
+
+def test_run_cap_stops_a_looping_run_but_not_other_runs(make_request):
+    scheduler = Scheduler(make_config(tpm=10_000, tenants=("a",), run_token_cap=500))
+    for request_id, run in (("r1", "loop"), ("r2", "loop"), ("r3", "other")):
+        scheduler.submit(make_request(id=request_id, est_input=200, max_output=100, run=run), now=0)
+    assert ids(scheduler.poll(0)) == ["r1", "r3"]
+    assert scheduler.take_failures() == [Failure("r2", Reason.RUN_BUDGET_EXHAUSTED)]
+
+
+def test_p0_demotion_is_reported_as_an_event(req):
+    sink = MemorySink()
+    scheduler = Scheduler(make_config(tpm=10_000, p0_rate=100, p0_burst=200), events=sink)
+    for name in ("p0a", "p0b", "p0c", "p0d"):
+        scheduler.submit(req(name, klass=Klass.P0), now=0)
+    scheduler.poll(0)
+    assert [e.fields["request_id"] for e in sink.named("llm.p0_demoted")] == ["p0c", "p0d"]
 
 
 def test_fair_queue_interleaves_tenants_while_fifo_does_not(req):

@@ -23,6 +23,10 @@ class QueuedRequest:
     def tenant(self) -> str:
         return self.request.tenant
 
+    @property
+    def key(self) -> str:
+        return f"{self.request.id}#{self.attempt}"
+
 
 class RequestQueue(Protocol):
     def has_tenant(self, tenant: str) -> bool: ...
@@ -30,6 +34,7 @@ class RequestQueue(Protocol):
     def requeue(self, item: QueuedRequest) -> None: ...
     def peek(self, now: float) -> QueuedRequest | None: ...
     def pop(self, now: float) -> QueuedRequest: ...
+    def remove(self, item: QueuedRequest) -> bool: ...
     def adjust(self, tenant: str, tokens: int) -> None: ...
 
 
@@ -113,8 +118,18 @@ class FairQueue:
         queue.take_head()
         queue.deficit -= item.cost
         if queue.empty:
-            self._deactivate()
+            self._deactivate(queue)
         return item
+
+    def remove(self, item: QueuedRequest) -> bool:
+        queue = self._tenants[item.tenant]
+        try:
+            queue.lane(item.klass).remove(item)
+        except ValueError:
+            return False
+        if queue.empty:
+            self._deactivate(queue)
+        return True
 
     def adjust(self, tenant: str, tokens: int) -> None:
         queue = self._tenants[tenant]
@@ -132,9 +147,12 @@ class FairQueue:
         if queue.empty:
             self._ring.append(queue)
 
-    def _deactivate(self) -> None:
-        queue = self._ring.pop(self._cursor)
+    def _deactivate(self, queue: _TenantQueue) -> None:
+        index = self._ring.index(queue)
+        self._ring.pop(index)
         queue.deficit = 0
         queue.topped_up = False
+        if index < self._cursor:
+            self._cursor -= 1
         if self._cursor >= len(self._ring):
             self._cursor = 0

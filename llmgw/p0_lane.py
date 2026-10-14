@@ -29,6 +29,13 @@ class P0Lane:
         item.attempt += 1
         self._items[item.tenant].appendleft(item)
 
+    def remove(self, item: QueuedRequest) -> bool:
+        try:
+            self._items[item.tenant].remove(item)
+        except ValueError:
+            return False
+        return True
+
     def peek(self, now: float) -> QueuedRequest | None:
         for name in self._rotation():
             items = self._items[name]

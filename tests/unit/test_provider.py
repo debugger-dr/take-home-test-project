@@ -6,6 +6,7 @@ from llmgw.config import ProviderLimits
 from llmgw.sim.provider import (
     CountingMode,
     FakeProvider,
+    Faulted,
     ProviderCall,
     ProviderModel,
     Started,
@@ -105,6 +106,33 @@ def test_same_seed_gives_same_usage_and_different_seed_differs():
 
     assert usages(1) == usages(1)
     assert usages(1) != usages(2)
+
+
+def test_faulted_call_still_consumes_provider_capacity():
+    provider = make_provider(fault_rate=1.0)
+    result = provider.send(call("a", 250, 250), now=0)
+    assert isinstance(result, Faulted)
+    assert provider.stats.faulted == 1
+    assert provider.stats.peak_tokens == 500
+    with pytest.raises(KeyError):
+        provider.finish("a", now=1)
+
+
+@pytest.mark.parametrize("window_mode", list(WindowMode))
+def test_resending_a_faulted_call_counts_both_attempts(window_mode):
+    provider = make_provider(fault_rate=1.0, window_mode=window_mode)
+    provider.send(call("a", 100, 100), now=0)
+    provider.send(call("a", 100, 100), now=1)
+    assert provider.stats.peak_tokens == 400
+    assert isinstance(provider.send(call("b", 350, 350), now=2), Throttled)
+
+
+def test_outage_throttles_everything_until_it_ends():
+    provider = make_provider(outage=(10.0, 30.0))
+    assert isinstance(provider.send(call("a"), now=5.0), Started)
+    assert provider.send(call("b"), now=12.0) == Throttled(retry_after=18.0)
+    assert isinstance(provider.send(call("b"), now=30.0), Started)
+    assert provider.stats.throttled == 1
 
 
 def test_finishing_an_unknown_call_raises():

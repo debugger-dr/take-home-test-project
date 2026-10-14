@@ -84,6 +84,16 @@ def test_requeue_returns_the_request_to_the_front(item):
     assert first.attempt == 2
 
 
+def test_remove_takes_a_waiting_request_out_of_the_lane(item):
+    lane, _ = make_lane(rate=10_000)
+    first, second = item("a1"), item("a2")
+    lane.push(first)
+    lane.push(second)
+    assert lane.remove(first)
+    assert not lane.remove(first)
+    assert lane.pop(0) is second
+
+
 def test_pop_from_empty_lane_raises():
     lane, _ = make_lane()
     with pytest.raises(IndexError):

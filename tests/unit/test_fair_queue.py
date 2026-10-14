@@ -145,6 +145,27 @@ def test_p2_is_not_promoted_before_the_threshold(item):
     assert queue.pop(29.9).request.id == "p2"
 
 
+def test_remove_takes_a_waiting_request_out_of_the_line(item):
+    queue = make_queue()
+    first, second = item("a1", "a"), item("a2", "a")
+    queue.push(first)
+    queue.push(second)
+    assert queue.remove(first)
+    assert not queue.remove(first)
+    assert drain(queue) == ["a2"]
+
+
+def test_removing_a_tenants_last_request_keeps_the_ring_consistent(item):
+    queue = make_queue({"a": 1, "b": 1, "c": 1})
+    a1, b1, c1, c2 = item("a1", "a"), item("b1", "b"), item("c1", "c"), item("c2", "c")
+    for request in (a1, b1, c1, c2):
+        queue.push(request)
+    assert queue.pop(0) is a1
+    assert queue.remove(b1)
+    assert drain(queue) == ["c1", "c2"]
+    assert queue.deficit("b") == 0
+
+
 def test_unknown_tenant_is_rejected(item):
     queue = make_queue()
     assert not queue.has_tenant("zzz")

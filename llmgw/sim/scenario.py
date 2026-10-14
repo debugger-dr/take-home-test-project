@@ -22,9 +22,14 @@ class Scenario:
     limits: ProviderLimits
     profiles: tuple[TenantProfile, ...]
     weights: Mapping[str, int] = field(default_factory=dict)
+    budgets: Mapping[str, int] = field(default_factory=dict)
     settings: Mapping[str, object] = field(default_factory=dict)
     counting: CountingMode = CountingMode.RESERVE_AT_START
     window_mode: WindowMode = WindowMode.ROLLING
+    fault_rate: float = 0.0
+    outage: tuple[float, float] | None = None
+    max_attempts: int = 1
+    retry_jitter: float = 1.0
     duration: float = 600.0
     drain: float = 60.0
     warmup: float = 60.0
@@ -35,12 +40,20 @@ class Scenario:
         return self.warmup, self.duration - self.warmup
 
     def scheduler_config(self) -> SchedulerConfig:
-        tenants = tuple(TenantConfig(p.tenant, self.weights.get(p.tenant, 1)) for p in self.profiles)
+        tenants = tuple(
+            TenantConfig(p.tenant, self.weights.get(p.tenant, 1), self.budgets.get(p.tenant))
+            for p in self.profiles
+        )
         return SchedulerConfig(self.limits, tenants, **self.settings)
 
     def run(self, make_scheduler: Callable[[SchedulerConfig], SchedulerPort] = Scheduler) -> Report:
         requests = Workload(self.profiles, self.seed).generate(self.duration)
-        model = ProviderModel(self.limits, self.counting, self.window_mode)
+        model = ProviderModel(
+            self.limits, self.counting, self.window_mode, fault_rate=self.fault_rate, outage=self.outage
+        )
         provider = FakeProvider(model, random.Random(self.seed + 1))
-        simulator = Simulator(make_scheduler(self.scheduler_config()), provider)
+        scheduler = make_scheduler(self.scheduler_config())
+        simulator = Simulator(
+            scheduler, provider, random.Random(self.seed + 2), self.max_attempts, self.retry_jitter
+        )
         return simulator.run(requests, until=self.duration + self.drain)

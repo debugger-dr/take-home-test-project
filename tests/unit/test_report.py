@@ -2,7 +2,7 @@ import pytest
 
 from llmgw.sim.provider import ProviderStats
 from llmgw.sim.report import Report, RequestRecord, percentile
-from llmgw.types import Klass
+from llmgw.types import Klass, Reason
 
 STATS = ProviderStats(0, 0, 0, 0, 0, 0)
 
@@ -50,6 +50,28 @@ def test_waits_can_be_filtered_by_class():
     report = Report(records, STATS, horizon=100)
     assert report.waits("a", 0, 10, Klass.P0) == [1.0]
     assert sorted(report.waits("a", 0, 10)) == [1.0, 5.0]
+
+
+def test_waits_ignore_rejected_requests_and_stop_counting_at_failure():
+    records = {
+        "failed": RequestRecord("a", Klass.P1, 2.0, failed=Reason.EXPIRED, failed_at=8.0),
+        "rejected": RequestRecord("a", Klass.P1, 3.0, rejected=Reason.QUEUE_FULL),
+        "waiting": RequestRecord("a", Klass.P1, 4.0),
+    }
+    report = Report(records, STATS, horizon=20.0)
+    assert sorted(report.waits("a", 0, 100)) == [6.0, 16.0]
+
+
+def test_served_ratio_counts_only_accepted_requests():
+    records = {
+        "done": RequestRecord("a", Klass.P1, 1.0, completed_at=5.0),
+        "lost": RequestRecord("a", Klass.P1, 2.0, failed=Reason.EXPIRED, failed_at=9.0),
+        "rejected": RequestRecord("a", Klass.P1, 3.0, rejected=Reason.QUEUE_FULL),
+        "urgent": RequestRecord("a", Klass.P0, 4.0, completed_at=6.0),
+    }
+    report = Report(records, STATS, horizon=20.0)
+    assert report.served_ratio("a", 0, 100) == pytest.approx(2 / 3)
+    assert report.served_ratio("a", 0, 100, Klass.P1) == 0.5
 
 
 def test_max_dispatch_gap_only_considers_dispatches_inside_the_window():
