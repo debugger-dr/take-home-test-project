@@ -1,0 +1,77 @@
+flowchart TB
+  %% ===== Outside the platform =====
+  subgraph EXT["Untrusted / external (TB1, TB5)"]
+    USER["Users & client apps"]
+    LLM["External LLM provider<br/>(single API key)"]
+    THIRD["Third-party & internal APIs<br/>(GitHub, etc.)"]
+    SPLUNK["Splunk Logging +<br/>Splunk Observability"]
+  end
+
+  %% ===== Shared control plane =====
+  subgraph CP["Platform control plane (shared, trusted) (TB2)"]
+    API["API / Ingress<br/>start run, cancel, human reply<br/>authn -> tenant + user"]
+    SCHED["Scheduler / Timer<br/>wakeups, timeouts, cancel,<br/>lease reaper"]
+    LLMGW["LLM Gateway (PoC SLICE)<br/>admission, per-tenant queues,<br/>DRR fairness, RPM/TPM buckets,<br/>reserve + reconcile, backpressure"]
+    TOOLGW["Tool Gateway<br/>authz (deny by default),<br/>credential injection, audit"]
+    SECRETS[("Secret store<br/>Vault / cloud secrets")]
+    DEFS[("Agent definitions<br/>YAML in S3 (repo in PoC)<br/>versioned, hash-pinned")]
+    subgraph PG["Postgres (state store)"]
+      PLAT[("platform schema<br/>tenants, LLM usage ledger")]
+      TSCHEMA[("tenant_X schema<br/>run event log, queue,<br/>audit, definition snapshot")]
+    end
+  end
+
+  %% ===== Per-tenant namespace =====
+  subgraph NS["Kubernetes namespace: tenant-X (quota + NetworkPolicy)"]
+    subgraph WP["Worker pool (warm floor, cold ceiling)"]
+      WORKER["Agent runtime worker<br/>LLM loop, NO secrets<br/>pulls from queue, holds lease"]
+    end
+    subgraph SBX["Sandbox pool (gVisor RuntimeClass) (TB4)"]
+      SANDBOX["Per-agent sandbox<br/>RO rootfs, scratch dir,<br/>CPU/mem/time limits,<br/>default-deny egress"]
+    end
+    PROXY["Egress proxy<br/>injects creds for CLIs (gh)<br/>host allowlist"]
+  end
+
+  %% ===== Flows =====
+  USER -->|"1. start / reply"| API
+  API -->|"2. load def, snapshot,<br/>enqueue run"| TSCHEMA
+  DEFS -.->|"def at pinned version"| API
+  WORKER -->|"3. pull + lease,<br/>append events"| TSCHEMA
+  SCHED -->|"re-enqueue on timer /<br/>human reply / lease expiry"| TSCHEMA
+
+  WORKER -->|"4. LLM request<br/>(run identity token)"| LLMGW
+  LLMGW -->|"5. fair-queued,<br/>rate-limited call"| LLM
+  LLMGW --> PLAT
+
+  WORKER -->|"6. tool call<br/>(run identity token)"| TOOLGW
+  TOOLGW -->|"authz + audit started/finished"| TSCHEMA
+  TOOLGW -->|"fetch scoped cred"| SECRETS
+  TOOLGW -->|"7a. API tool: call with cred"| THIRD
+  TOOLGW -->|"7b. exec tool: dispatch"| SANDBOX
+  SANDBOX -->|"only reachable egress"| PROXY
+  PROXY -->|"cred added outbound"| THIRD
+  PROXY -.->|"fetch scoped cred"| SECRETS
+
+  %% ===== Edges added after review =====
+  TSCHEMA -->|"run status, results,<br/>pending human question"| API
+  API -->|"responses, push of agent<br/>question + final result"| USER
+  SCHED -->|"cancel / timeout kill"| SANDBOX
+  LLMGW -->|"per-call tokens + cost<br/>appended to run log"| TSCHEMA
+  PROXY -->|"egress audit"| TSCHEMA
+
+  WORKER -.->|"logs, metrics, traces"| SPLUNK
+  TOOLGW -.-> SPLUNK
+  LLMGW -.-> SPLUNK
+  API -.-> SPLUNK
+  SCHED -.-> SPLUNK
+  PROXY -.-> SPLUNK
+
+  %% ===== Styling =====
+  classDef untrusted fill:#fdecea,stroke:#c0392b;
+  classDef trusted fill:#e8f4fd,stroke:#2471a3;
+  classDef notrust fill:#fff4e0,stroke:#d68910;
+  classDef slice fill:#e3f6e8,stroke:#1e8449,stroke-width:3px;
+  class USER,LLM,THIRD,SPLUNK untrusted;
+  class API,SCHED,LLMGW,TOOLGW,SECRETS,DEFS,PLAT,TSCHEMA trusted;
+  class LLMGW slice;
+  class WORKER,SANDBOX,PROXY notrust;

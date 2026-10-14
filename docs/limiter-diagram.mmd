@@ -1,0 +1,31 @@
+flowchart LR
+  W["Workers<br/>(all tenants)"]
+  ADM["1. Admission<br/>class derived from run state<br/>budget, size cap, queue bound"]
+  Q["2. Per-tenant queues<br/>Tenant A | B | C<br/>P0 lane, then P1 > P2 + aging<br/>(bounded)"]
+  D["3. DRR dispatcher<br/>P0 first (own allowance)<br/>reserve est. tokens<br/>RPM/TPM buckets at 90%<br/>head waits, never skipped"]
+  P["LLM provider<br/>(1 key, RPM/TPM)"]
+  R["4. Reconcile<br/>actual tokens, refund difference"]
+  L[("Ledger<br/>SQLite in PoC,<br/>Postgres in design<br/>+ Splunk events")]
+  REJ["Reject: retry_after<br/>run requeued, no worker held"]
+  AIMD["STRETCH: AIMD<br/>cut rate on 429 / Retry-After"]
+  STBY["STRETCH: standby + leader lease<br/>new leader dispatches nothing<br/>for one window"]
+
+  W -->|"llm request<br/>{tenant, run, class,<br/>est tokens}"| ADM
+  ADM -->|"accepted"| Q
+  ADM -.->|"over budget / queue full /<br/>wait > deadline"| REJ
+  REJ -.-> W
+  Q --> D
+  D -->|"dispatch"| P
+  P -->|"response + actual usage"| R
+  R -->|"refund / correct buckets"| D
+  R --> L
+  P -.->|"429"| AIMD
+  AIMD -.-> D
+  STBY -.-> D
+
+  classDef built fill:#e3f6e8,stroke:#1e8449;
+  classDef stretch fill:#f4f4f4,stroke:#888,stroke-dasharray: 5 3;
+  classDef bad fill:#fdecea,stroke:#c0392b;
+  class ADM,Q,D,R built;
+  class AIMD,STBY stretch;
+  class REJ bad;
