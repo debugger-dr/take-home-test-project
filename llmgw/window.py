@@ -68,10 +68,9 @@ class WindowAccountant:
         return math.inf
 
     def _expire(self, now: float) -> None:
-        cutoff = now - self._window
         while self._entries:
             oldest = next(iter(self._entries.values()))
-            if oldest.at > cutoff:
+            if oldest.at + self._window > now:
                 return
             self._entries.popitem(last=False)
             self._used -= oldest.amount

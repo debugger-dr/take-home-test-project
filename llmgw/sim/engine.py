@@ -49,7 +49,7 @@ class Simulator:
             elif kind is _Kind.COMPLETE:
                 self._complete(key, now)
             self._dispatch_ready(now)
-        return Report(self._records, self._provider.stats)
+        return Report(self._records, self._provider.stats, until)
 
     def _push(self, at: float, kind: _Kind, key: str) -> None:
         heapq.heappush(self._events, (at, next(self._sequence), kind, key))

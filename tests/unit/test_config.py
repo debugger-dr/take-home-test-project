@@ -62,7 +62,14 @@ def test_tenant_names_must_be_unique():
 
 @pytest.mark.parametrize(
     "field,value",
-    [("headroom", 0), ("headroom", 1.1), ("input_safety", 0.9), ("base_quantum", 0)],
+    [
+        ("headroom", 0),
+        ("headroom", 1.1),
+        ("input_safety", 0.9),
+        ("base_quantum", 0),
+        ("pacing_burst", -0.1),
+        ("pacing_burst", 1.5),
+    ],
 )
 def test_invalid_scheduler_settings_are_rejected(field, value):
     with pytest.raises(ValueError):

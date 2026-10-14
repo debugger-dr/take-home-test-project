@@ -48,7 +48,7 @@ one test of the safety or scale property claimed, and an AI usage log. The justi
 - **It is the largest cost line**, so it is where cost control (budgets, per-agent attribution) has to live.
 - **It is the only place all tenants contend**, so multi-tenant fairness is real here and nowhere else.
 - **It is the uncertain part.** Token costs are unknown until after the call, the provider's real window semantics are unknown,
-  and a fair scheduler with priorities must still bound a quiet tenant's wait. Those are correctness problems under imperfect
+  and a fair scheduler with priorities must still bound a quiet tenant's wait.
   information, which is the kind of risk a PoC should retire.
 - **Why not the sandbox** (the other risky area): gVisor does not run on macOS, so a local demo would be a stand-in. The limiter runs
   faithfully anywhere. This is a choice made for impact, not familiarity, and the sandbox executor is what we would build second.
@@ -79,6 +79,7 @@ The design changed several times. Recording the changes shows the reasoning and 
 | 9 | Priority | Agent or caller sets priority; ~15% bucket reserved for P0 | Gameable; reserve wastes quota when no P0 exists | Class derived by the platform from run state; per-tenant P0 allowance; P0 charged to the tenant's own fairness account |
 | 10 | Quota accounting | Token buckets at 90% | Bucket math couples burst capacity to the largest request (section 6.5) | Sliding-window accountant that mirrors the provider's window; headroom 10% |
 | 11 | Test strategy | Real-time async clients | Per-minute limits make tests slow and flaky | Deterministic core + discrete-event simulator in virtual time |
+| 12 | Dispatch smoothness | Window accountant alone | Found by T1: idle-arrival waits were bimodal (most under 1 s, some 25 to 37 s). Greedy dispatch fills the window in one burst, then nothing can dispatch until that burst expires a window later, and the cycle repeats. The window keeps us safe but not smooth | A pacer (generic cell rate algorithm) in front of the window; the window stays as the safety net (section 6.5a) |
 
 Every row is a candidate entry for the AI log where an AI suggestion was overridden or corrected (section 15.2).
 
@@ -122,6 +123,7 @@ Each decision states the choice, the rejected alternative, why, and the conditio
 | D13 | Fake provider is an **independent oracle** (never imports the scheduler) | Assert on the gateway's own counters | A test that checks the gateway against its own beliefs proves nothing | n/a |
 | D14 | Python, standard library only at runtime; `pytest` as the only dev dependency; SQLite ledger | FastAPI/aiohttp, Redis, Postgres container | One-command run with no install surprises; the design does not depend on those libraries | Wrapper needs real async concurrency at scale |
 | D15 | Queues in memory; losing them is safe | Durable LLM-request queue in Postgres | Runs are durable and retry on `retry_after` or connection loss; durable per-request queue adds a write per LLM call for little gain at this scale | Duplicate paid calls after failover become a material cost |
+| D16 | **Pace dispatches** at the usable rate (generic cell rate algorithm, burst tolerance 5% of the window), in addition to the window accountant | Window accountant alone | The window bounds the total but not the shape: against a sliding window a greedy dispatcher produces burst and stall cycles that repeat every window, so any request arriving during a stall waits for it regardless of fairness | The provider enforces a pure token bucket with its own burst allowance, making pacing redundant |
 
 ---
 
@@ -263,6 +265,23 @@ capacity. We allow it (the provider's truth wins) and rely on the 10% headroom p
 reconcile, only in-flight requests carry estimate error; see the worked example in 18.3. If it ever pushes the
 sum above the provider limit the next provider response will be a 429 and the cooldown path engages (section 6.9).
 
+### 6.5a Pacing: why the window alone is not enough
+
+The window accountant is the **safety** mechanism. It does not control the **shape** of dispatch. Against a sliding window, greedy dispatch behaves as follows:
+1. At start the window is empty and arrivals are faster than the usable rate, so the window fills in one burst (about 18 s at the default load).
+2. Nothing can dispatch until those entries expire a full window after they were dispatched.
+3. They expire as the same burst, dispatch bursts again, and the cycle repeats forever (a delay feedback loop with period equal to the window).
+
+The average rate is correct but dispatch alternates between rapid bursts and stalls of tens of seconds. Every tenant's tail latency suffers, and fairness cannot help because
+there is no quota to share during a stall. The scenario test caught this: idle-arrival waits were bimodal, with most under 1 s and a few at 25 to 37 s.
+
+**Fix:** a `Pacer` (generic cell rate algorithm) per window accountant. Each dispatch advances a virtual clock by `cost / rate`; a dispatch is allowed once `now >= virtual_clock - tolerance`.
+- Rate is the usable rate (tokens per second, and requests per second for the request window). Tolerance is `pacing_burst` of the window (default 5%, 3 s).
+- Idle time is not banked: the virtual clock is clamped to `now` on commit, so a long idle period never buys a large burst.
+- A completion refunds the pacer by `reserved - actual`, so pacing follows actual usage. A provider 429 refunds the full cost.
+- The window accountant still gates every dispatch, so safety does not depend on the pacer being right.
+- Negative control: `unpaced_scheduler` (`pacing_burst = 1.0`) must show the stalls (test T1d).
+
 ### 6.6 Fair dispatch: deficit round robin in tokens
 
 State per tenant: `weight`, `deficit` (tokens), per-class FIFO queues, `topped_up` flag. Global: ordered list of active tenants and a cursor.
@@ -303,8 +322,10 @@ def poll(self, now):
 
 Properties and why they hold:
 - **Work conserving:** a tenant with no backlog is removed from `active`, so its share flows to the others (its deficit resets to 0 so it cannot hoard credit).
-- **Bounded wait for a quiet tenant:** one round is `sum(quantum_j over active) / usable_rate`. A request of cost `c` waits at most
-  `(ceil(c / quantum_i) + 1)` rounds regardless of how deep a noisy tenant's queue is.
+- **Bounded wait for a quiet tenant:** in one round each tenant is served at most `quantum_j + max_cost` tokens, so a round lasts at most
+  `round_max = sum(quantum_j + max_cost over active) / usable_rate`. A request that arrives to an **empty own queue** waits at most
+  `(ceil(c / quantum_i) + 1)` rounds regardless of how deep a noisy tenant's queue is. A request that arrives behind `k` of its own tenant's
+  requests also waits for those; that is ordinary queueing inside the tenant's own share (utilization = offered load / fair share) and is not a fairness violation.
 - **Selection is idempotent while blocked:** if the selected head does not fit the window, `poll` returns without consuming the turn; the next `poll`
   re-selects the same candidate (the `topped_up` flag prevents double top-up).
 - **No starvation of large requests:** the head is never bypassed, and deficit carries over across rounds until it can pay.
@@ -496,6 +517,8 @@ Goal: satisfy "must run locally with one command" and show the same core behavin
 | 25 | Streaming responses | Usage known only at the end | Out of scope; reservation is already conservative; noted in cut list | Cut list |
 | 26 | Clock skew between gateway replicas | Window mismatch | Single dispatcher owns time; standby waits one window after takeover | S2 |
 | 27 | Provider limits shared with other workloads on the key | Our share is smaller than configured | 429 cooldown plus AIMD stretch; headroom | T4b, S1 |
+| 28 | Stop-and-go dispatch against a sliding window | Bursts echo every window; waits of tens of seconds for every tenant even when quota is fair | Pacer in front of the window (6.5a, D16); caught by T1 | T1d |
+| 29 | Tail latency from queueing inside a tenant's own share | A tenant at 50% of its share still has a p99 tail | Not a fairness failure; the guarantee is stated for arrivals to an empty own queue (6.6) | T1 |
 
 ---
 
@@ -511,8 +534,10 @@ Goal: satisfy "must run locally with one command" and show the same core behavin
 
 ```
 usable_rate      = 0.9 * TPM / window                    # 6,000 tokens/s in the main scenario
-round_time       = sum(quantum_j for active j) / usable_rate   # 3 * 4,000 / 6,000 = 2.0 s
-wait_bound(c, i) = (ceil(c / quantum_i) + 1) * round_time      # typical c ~ 3,000: (1+1)*2 = 4 s
+round_time       = sum(quantum_j for active j) / usable_rate   # typical round: 3 * 4,000 / 6,000 = 2.0 s
+round_max        = sum(quantum_j + max_cost) / usable_rate     # worst round: 3 * (4,000 + 5,624) / 6,000 = 4.8 s
+wait_bound(c, i) = (ceil(c / quantum_i) + 1) * round_max + max_cost / usable_rate
+                                                          # request arriving to an empty own queue, c = max_cost: 3 * 4.8 + 0.9 = 15.4 s
 fair_share_i     = weighted max-min allocation of usable capacity given each tenant's offered load (water filling)
 ```
 
@@ -520,7 +545,8 @@ fair_share_i     = weighted max-min allocation of usable capacity given each ten
 
 | ID | Claim | Setup | Assertions (all must hold) | Negative control that must fail |
 |---|---|---|---|---|
-| **T1** Noisy neighbour | A tenant offering 10x load cannot starve others | A offers 1.2M tokens/min; B and C offer 60k each (below fair share 120k). Equal weights | B, C goodput >= 95% of offered; B, C queue-wait p99 <= `wait_bound` + 0.5 s; total goodput >= 90% of usable capacity (work conserving); A receives the remainder (>= 85% of usable minus B and C) | `FifoNoFairness`: B p99 wait exceeds 10x the bound |
+| **T1** Noisy neighbour | A tenant offering 10x load cannot starve others | A offers 1.2M tokens/min; B and C offer 60k each (below fair share 120k). Equal weights | B, C goodput >= 95% of offered; for requests arriving to an empty own queue, B and C queue-wait p99 <= `wait_bound`; total goodput >= 90% of usable capacity (work conserving); A receives the remainder (>= 85% of usable minus B and C) | `FifoNoFairness`: B p99 wait exceeds 10x the bound |
+| **T1d** Smooth dispatch | Dispatch has no stop-and-go cycles | Same as T1 | Under saturation the longest gap between consecutive dispatches in the measurement window <= 3 * max_cost / usable_rate (about 2.8 s) | `unpaced_scheduler`: longest gap exceeds window / 4 (15 s) |
 | **T1b** Above-share tenant | A tenant demanding more than its share still gets its share | B offers 150k (above 120k fair share) with A noisy | B goodput >= 0.95 * fair_share_B; B never exceeds its share when others are backlogged by more than one quantum per round | FIFO control |
 | **T1c** Weights | Weighted shares are honoured | Weights 1:2:1 with all backlogged | Goodput ratios within 5% of 1:2:1 | Equal-weight scheduler |
 | **T2** Quota safety | The provider is never driven over its limit | Main scenario, both window modes, both counting modes | Provider-observed max tokens in any rolling window <= `TPM`; max requests <= `RPM`; provider 429 count <= 1% of calls (in steady state, zero) | `NoQuotaCheck`: provider 429s exceed 10% |

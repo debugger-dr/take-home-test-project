@@ -1,5 +1,10 @@
 from collections import deque
+from collections.abc import Iterable
+from dataclasses import replace
 
+from llmgw.config import SchedulerConfig
+from llmgw.fair_queue import QueuedRequest
+from llmgw.scheduler import Scheduler
 from llmgw.types import Accepted, Dispatch, LLMRequest, Rejected, Usage
 
 
@@ -29,3 +34,46 @@ class PassThroughScheduler:
 
     def next_wakeup(self, now: float) -> float | None:
         return None
+
+
+class FifoQueue:
+    """Negative control: one global first-in-first-out line, no per-tenant fairness."""
+
+    def __init__(self, tenants: Iterable[str]) -> None:
+        self._tenants = frozenset(tenants)
+        self._items: deque[QueuedRequest] = deque()
+
+    def has_tenant(self, tenant: str) -> bool:
+        return tenant in self._tenants
+
+    def push(self, item: QueuedRequest) -> None:
+        self._items.append(item)
+
+    def requeue(self, item: QueuedRequest) -> None:
+        item.attempt += 1
+        self._items.appendleft(item)
+
+    def peek(self) -> QueuedRequest | None:
+        return self._items[0] if self._items else None
+
+    def pop(self) -> QueuedRequest:
+        return self._items.popleft()
+
+    def adjust(self, tenant: str, tokens: int) -> None:
+        pass
+
+
+def fifo_scheduler(config: SchedulerConfig) -> Scheduler:
+    return Scheduler(config, FifoQueue(t.name for t in config.tenants))
+
+
+def unpaced_scheduler(config: SchedulerConfig) -> Scheduler:
+    """Negative control: safe against the window, but dispatches in bursts followed by stalls."""
+    return Scheduler(replace(config, pacing_burst=1.0))
+
+
+class NoQuotaScheduler(Scheduler):
+    """Negative control: fair dispatch, but ignores the provider's rate window."""
+
+    def _fits(self, cost: int, now: float) -> bool:
+        return True
